@@ -1,6 +1,15 @@
+#define _POSIX_C_SOURCE 200809L
+#define _FILE_OFFSET_BITS 64   /* video files over 2 GB */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <stdarg.h>
+
+#define PATHBUF 4096
 
 enum { LINE_TEXT = 0, LINE_SEQ = 1, LINE_TIME = 2 };
 enum { TXT_SAME = 0, TXT_CONVERTED = 1, TXT_REPAIRED = 2 };
@@ -36,18 +45,25 @@ static const unsigned short CP1256[128] = {
 static const unsigned short CP1252[32] = {
     0x20AC,0x0081,0x201A,0x0192,0x201E,0x2026,0x2020,0x2021,
     0x02C6,0x2030,0x0160,0x2039,0x0152,0x008D,0x017D,0x008F,
-    0x0090,0x2018,0x2019,0x201C,0x201D,0x2022,0x017E,0x2014,
+    0x0090,0x2018,0x2019,0x201C,0x201D,0x2022,0x2013,0x2014,
     0x02DC,0x2122,0x0161,0x203A,0x0153,0x009D,0x017E,0x0178
 };
 
+static const char *VIDEO_EXT[] = {
+   "mp4", "mkv", "avi", "mov", "wmv", "m4v", "flv", "webm", "mpg", "mpeg", "ts", "mts", NULL
+};
+
+
 static void usage(void) {
     fprintf(stderr,
-        "Usage: srtfix <file.srt> [-e] [-s <ms>] [-t <anchorSeq> <targetSeq> <hh:mm:ss,fff>] [-o <out.srt>]\n"
+        "Usage: srtfix <file.srt> [-e] [-s <ms>] [-t <anchorSeq> <targetSeq> <hh:mm:ss,fff>] [-r] [-o <out.srt>]\n"
         "  -e   fix subtitle text encoding -> UTF-8. Handles genuine windows-1256 bytes and\n"
         "       1256 text that was misread as 1252 and saved as UTF-8 (mojibake)\n"
         "  -s   shift all timestamps by <ms> (negative allowed)\n"
         "  -t   keep cue <anchorSeq> fixed; cue <targetSeq> should start at the given time;\n"
         "       linearly stretch/shrink everything from the anchor to the end of the file\n"
+	"  -r   name the result after the largest video file in the same folder\n"
+	"       (an existing <video>.srt is renamed to <video>.old.srt first)\n"
         "  -o   output file (default: <name>.fixed.srt)\n");
 }
 
@@ -65,6 +81,92 @@ static char *read_file(const char *path, size_t *len) {
     return buf;
 }
 
+/* ---------- file / folder helpers ---------- */
+
+static const char *last_sep(const char *p) {
+    const char *s = strrchr(p, '/');
+#ifdef _WIN32
+    const char *b = strrchr(p, '\\');
+    if (b && (!s || b > s)) s = b;
+#endif
+    return s;
+}
+
+static void dir_of(const char *path, char *dir, size_t cap) {
+    const char *sep = last_sep(path);
+    if (!sep)              snprintf(dir, cap, ".");
+    else if (sep == path)  snprintf(dir, cap, "/");
+    else                   snprintf(dir, cap, "%.*s", (int)(sep - path), path);
+}
+
+static int ieq(const char *a, const char *b) {
+    for (; *a && *b; a++, b++)
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+    return *a == *b;
+}
+
+static int is_video(const char *name) {
+    const char *dot = strrchr(name, '.');
+    if (!dot || dot == name) return 0;
+    for (int i = 0; VIDEO_EXT[i]; i++)
+        if (ieq(dot + 1, VIDEO_EXT[i])) return 1;
+    return 0;
+}
+
+static int exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+static int same_file(const char *a, const char *b) {
+    struct stat sa, sb;
+    return stat(a, &sa) == 0 && stat(b, &sb) == 0 &&
+           sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
+/* snprintf that reports truncation: returns 1 if everything fit, else 0 */
+static int path_fmt(char *dst, size_t cap, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(dst, cap, fmt, ap);
+    va_end(ap);
+    return r >= 0 && (size_t)r < cap;
+}
+
+/* Finds the largest video file in dir. Returns 1 and the file name (no folder) in name. */
+static int find_largest_video(const char *dir, char *name, size_t cap) {
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    struct dirent *e;
+    off_t best = -1;
+    char path[PATHBUF];
+    while ((e = readdir(d)) != NULL) {
+        if (!is_video(e->d_name)) continue;
+	if (!path_fmt(path, sizeof path, "%s/%s", dir, e->d_name)) continue;  /* too long: skip */
+        struct stat st;
+        if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (st.st_size > best) {
+            best = st.st_size;
+            snprintf(name, cap, "%s", e->d_name);
+        }
+    }
+    closedir(d);
+    return best >= 0;
+}
+
+/* Renames target out of the way: <base>.old.srt, then <base>.old1.srt, ... */
+static int move_aside(const char *target, const char *dir, const char *base,
+                      char *newpath, size_t cap) {
+    for (int k = 0; k < 1000; k++) {
+        int ok = (k == 0)
+            ? path_fmt(newpath, cap, "%s/%s.old.srt", dir, base)
+            : path_fmt(newpath, cap, "%s/%s.old%d.srt", dir, base, k);
+        if (!ok) return 0;
+        if (!exists(newpath))
+            return rename(target, newpath) == 0;
+    }
+    return 0;
+}
 /* ---------- encoding helpers ---------- */
 
 /* Strict decode of one 1-3 byte UTF-8 sequence. Returns its length, or 0 if invalid. */
@@ -170,12 +272,15 @@ int main(int argc, char **argv) {
 
     const char *input = argv[1];
     char *output = NULL;
-    int convert = 0, stretch = 0;
+    int convert = 0, stretch = 0, rename_to_video = 0;
     long shift = 0, anchorSeq = 0, targetSeq = 0, correct = 0;
+    char dir[PATHBUF], vname[PATHBUF], base[PATHBUF], target[PATHBUF], aside[PATHBUF];
 
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-e")) {
             convert = 1;
+	} else if (!strcmp(argv[i], "-r")) {
+	    rename_to_video = 1;
         } else if (!strcmp(argv[i], "-s") && i + 1 < argc) {
             shift = atol(argv[++i]);
         } else if (!strcmp(argv[i], "-t") && i + 3 < argc) {
@@ -193,6 +298,50 @@ int main(int argc, char **argv) {
             usage();
             return 1;
         }
+    }
+
+    if (rename_to_video && output) {
+	fprintf(stderr, "-r and -o cannot be combined (-r chooses the output name).\n");
+	return 1;
+    }
+
+    /* ---- -r: work out the video-based name before touching anything ---- */
+    int process = convert || stretch || shift != 0;
+    if (rename_to_video) {
+        dir_of(input, dir, sizeof dir);
+        if (!find_largest_video(dir, vname, sizeof vname)) {
+            fprintf(stderr, "No video file found in %s\n", dir);
+            return 1;
+        }
+        snprintf(base, sizeof base, "%s", vname);
+        char *dot = strrchr(base, '.');
+        if (dot) *dot = '\0';                /* name without extension */
+        
+
+        if (!path_fmt(target, sizeof target, "%s/%s.srt", dir, base)) {
+            fprintf(stderr, "Path too long: %s/%s.srt\n", dir, base);
+            return 1;
+        }
+
+        printf("Largest video: %s\n", vname);
+
+        if (!process) {                      /* pure rename: no rewrite needed */
+            if (same_file(input, target)) {
+                printf("Already named after the video: %s\n", target);
+                return 0;
+            }
+            if (exists(target)) {
+                if (!move_aside(target, dir, base, aside, sizeof aside)) {
+                    fprintf(stderr, "Cannot rename existing %s out of the way\n", target);
+                    return 1;
+                }
+                printf("Existing %s renamed to %s\n", target, aside);
+            }
+            if (rename(input, target) != 0) { perror("rename"); return 1; }
+            printf("Renamed: %s -> %s\n", input, target);
+            return 0;
+        }
+        output = target;                     /* processed result takes the video's name */
     }
 
     /* ---- read raw bytes ---- */
@@ -278,18 +427,35 @@ int main(int argc, char **argv) {
     }
 
     /* ---- output path ---- */
-    char defname[1024];
+    char defname[PATHBUF];
     if (!output) {
         const char *dot = strrchr(input, '.');
-        const char *sl1 = strrchr(input, '/');
-        const char *sl2 = strrchr(input, '\\');
-        const char *sep = sl1 > sl2 ? sl1 : sl2;
-        int base = (dot && (!sep || dot > sep)) ? (int)(dot - input) : (int)strlen(input);
-        snprintf(defname, sizeof defname, "%.*s.fixed.srt", base, input);
+        const char *sep = last_sep(input);
+        int stem = (dot && (!sep || dot > sep)) ? (int)(dot - input) : (int)strlen(input);
+        if (!path_fmt(defname, sizeof defname, "%.*s.fixed.srt", stem, input)) {
+            fprintf(stderr, "Output path too long\n");
+            return 1;
+        }
         output = defname;
     }
+
+    /* -r: an existing <video>.srt is renamed out of the way before we write */
+    int moved = 0;
+    if (rename_to_video && exists(output)) {
+        if (!move_aside(output, dir, base, aside, sizeof aside)) {
+            fprintf(stderr, "Cannot rename existing %s out of the way\n", output);
+            return 1;
+        }
+        moved = 1;
+        printf("Existing %s renamed to %s\n", output, aside);
+    }
+
     FILE *out = fopen(output, "wb");
-    if (!out) { fprintf(stderr, "Cannot write %s\n", output); return 1; }
+    if (!out) {
+        fprintf(stderr, "Cannot write %s\n", output);
+        if (moved) rename(aside, output);    /* put it back */
+        return 1;
+    }
 
     /* ---- write ---- */
     int same = 0, converted = 0, repaired = 0;
