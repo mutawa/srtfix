@@ -77,6 +77,46 @@ int srt_renumber(SrtFile *s) {
     return changed;
 }
 
+int srt_cue_text_range(const SrtFile *s, int ci, int *first, int *count) {
+    int begin = s->cues[ci].time_line + 1;
+    int limit = s->nlines;
+    if (ci + 1 < s->ncues) limit = s->cues[ci + 1].time_line - 1;   /* the next cue's number line */
+    int end = begin;
+    while (end < limit && s->lines[end][0]) end++;
+    *first = begin;
+    *count = end - begin;
+    return *count;
+}
+
+int srt_check_brackets(const SrtFile *s, BracketReport *rep) {
+    int count = 0;
+    StrBuf text;
+    sb_init(&text);
+    if (rep) memset(rep, 0, sizeof *rep);
+
+    for (int i = 0; i < s->ncues; i++) {
+        int first, n;
+        srt_cue_text_range(s, i, &first, &n);
+        sb_clear(&text);
+        for (int k = 0; k < n; k++) {
+            if (k) sb_puts(&text, "\n");
+            sb_puts(&text, s->lines[first + k]);
+        }
+        BracketInfo bi;
+        if (brackets_check(sb_str(&text), &bi)) {
+            if (rep && rep->listed < BRACKET_MAX_LISTED) {
+                rep->index[rep->listed] = i;
+                rep->info[rep->listed]  = bi;
+                rep->listed++;
+            }
+            count++;
+        }
+    }
+    sb_free(&text);
+    if (rep) rep->count = count;
+    return count;
+}
+
 void srt_free(SrtFile *s) {
     free(s->cues);
     free(s->lines);
@@ -132,11 +172,15 @@ SrtStatus srt_load(SrtFile *s, const char *path) {
     return SRT_OK;
 }
 
-SrtStatus srt_write(const SrtFile *s, const char *path, int fix_encoding, EncStats *stats) {
+SrtStatus srt_write(const SrtFile *s, const char *path, const TextOptions *opt, TextStats *stats) {
     FILE *out = fopen(path, "wb");
     if (!out) return SRT_ERR_WRITE;
 
-    if (fix_encoding || s->had_bom)          /* we produce (or kept) UTF-8 */
+    TextWork work;
+    textwork_init(&work);
+    SrtStatus result = SRT_OK;
+
+    if (opt->fix_encoding || s->had_bom)     /* we produce (or kept) UTF-8 */
         fputs("\xEF\xBB\xBF", out);
 
     int ci = 0;                              /* next cue whose lines we haven't reached */
@@ -152,16 +196,17 @@ SrtStatus srt_write(const SrtFile *s, const char *path, int fix_encoding, EncSta
         } else if (c && i == c->time_line - 1) {
             if (s->renumbered) fprintf(out, "%ld", c->seq);   /* new number */
             else               fputs(s->lines[i], out);       /* copied as-is */
-        } else if (fix_encoding) {           /* subtitle text (and blank lines) */
-            EncKind k = enc_write_line(out, s->lines[i]);
-            if (stats && s->lines[i][0]) enc_stats_add(stats, k);
-        } else {
-            fputs(s->lines[i], out);
+        } else {                             /* subtitle text (and blank lines) */
+            const char *txt = textfix_line(opt, s->lines[i], &work, stats);
+            if (!txt) { result = SRT_ERR_MEMORY; break; }
+            fputs(txt, out);
         }
         fputs("\r\n", out);
     }
 
+    textwork_free(&work);
     int bad = ferror(out);
     if (fclose(out) != 0) bad = 1;
+    if (result != SRT_OK) return result;
     return bad ? SRT_ERR_WRITE : SRT_OK;
 }

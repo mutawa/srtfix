@@ -2,7 +2,8 @@
 #ifndef SRT_H
 #define SRT_H
 
-#include "encoding.h"
+#include "brackets.h"
+#include "textfix.h"
 
 typedef struct {
     long        seq;         /* sequence number on the line before the timestamp */
@@ -37,9 +38,9 @@ SrtStatus srt_load(SrtFile *s, const char *path);
 void      srt_free(SrtFile *s);
 
 /* Writes the file with CRLF line endings. Timestamp lines are regenerated from
- * the cues, sequence lines are copied as-is, and every other line goes through
- * the encoding fixer when fix_encoding is set. stats may be NULL. */
-SrtStatus srt_write(const SrtFile *s, const char *path, int fix_encoding, EncStats *stats);
+ * the cues, sequence lines are copied as-is (or renumbered), and every other
+ * line goes through the text fixes selected in opt. stats may be NULL. */
+SrtStatus srt_write(const SrtFile *s, const char *path, const TextOptions *opt, TextStats *stats);
 
 /* First line of subtitle text of a cue ("" if it has none). */
 const char *srt_cue_text(const SrtFile *s, const Cue *c);
@@ -60,6 +61,25 @@ int srt_check_numbering(const SrtFile *s, NumberingInfo *info);
  * file were; srt_write then writes the new numbers. Returns how many cues got a
  * different number than they had. */
 int srt_renumber(SrtFile *s);
+
+/* The text lines of cue number `ci` (an index into cues): lines first .. first+count-1
+ * of SrtFile.lines, from just after the timestamp up to the first blank line.
+ * Returns count (0 if the cue has no text). */
+int srt_cue_text_range(const SrtFile *s, int ci, int *first, int *count);
+
+#define BRACKET_MAX_LISTED 5
+
+typedef struct {
+    int         count;                          /* cues with unbalanced brackets */
+    int         listed;                         /* how many are recorded below */
+    int         index[BRACKET_MAX_LISTED];      /* the first few, as indexes into cues */
+    BracketInfo info[BRACKET_MAX_LISTED];       /* what is unmatched in each */
+} BracketReport;
+
+/* Checks every cue's text (all its lines together, so a bracket may open on one
+ * line and close on the next). Returns the number of cues with unbalanced
+ * brackets; rep may be NULL. */
+int srt_check_brackets(const SrtFile *s, BracketReport *rep);
 
 /* Parses "hh:mm:ss,fff" (or with '.') into milliseconds. Returns 1 on success. */
 int srt_parse_time(const char *text, long *ms);

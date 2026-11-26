@@ -1,7 +1,8 @@
+
 CC      ?= gcc
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra
 BIN      = bin/srtfix
-SRCS     = main.c srt.c encoding.c timing.c fsutil.c
+SRCS     = main.c srt.c textfix.c markup.c bidi.c brackets.c encoding.c strbuf.c timing.c fsutil.c
 OBJS     = $(SRCS:%.c=obj/%.o)
 
 all: $(BIN)

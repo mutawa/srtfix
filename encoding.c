@@ -32,7 +32,7 @@ static const unsigned short CP1252_C1[32] = {
 
 /* Strict decode of one 1-3 byte UTF-8 sequence.
  * Returns its length, or 0 if the bytes are not valid UTF-8. */
-static int utf8_decode(const unsigned char *s, unsigned *cp) {
+int enc_utf8_decode(const unsigned char *s, unsigned *cp) {
     if (s[0] < 0x80) { *cp = s[0]; return 1; }
     if (s[0] >= 0xC2 && s[0] <= 0xDF && (s[1] & 0xC0) == 0x80) {
         *cp = ((s[0] & 0x1Fu) << 6) | (s[1] & 0x3Fu);
@@ -45,19 +45,6 @@ static int utf8_decode(const unsigned char *s, unsigned *cp) {
     return 0;
 }
 
-static void put_utf8(FILE *out, unsigned cp) {
-    if (cp < 0x80) {
-        fputc((int)cp, out);
-    } else if (cp < 0x800) {
-        fputc((int)(0xC0 | (cp >> 6)), out);
-        fputc((int)(0x80 | (cp & 0x3F)), out);
-    } else {
-        fputc((int)(0xE0 | (cp >> 12)), out);
-        fputc((int)(0x80 | ((cp >> 6) & 0x3F)), out);
-        fputc((int)(0x80 | (cp & 0x3F)), out);
-    }
-}
-
 /* Unicode code point -> the windows-1252 byte that decodes to it, or -1 */
 static int cp1252_byte(unsigned cp) {
     if (cp < 0x80) return (int)cp;
@@ -67,7 +54,7 @@ static int cp1252_byte(unsigned cp) {
     return -1;
 }
 
-EncKind enc_write_line(FILE *out, const char *line) {
+EncKind enc_convert_line(const char *line, StrBuf *out) {
     const unsigned char *s = (const unsigned char *)line, *p;
     unsigned cp;
     int len, ascii = 1, valid_utf8 = 1, all_1252 = 1, has_arabic = 0;
@@ -76,7 +63,7 @@ EncKind enc_write_line(FILE *out, const char *line) {
     for (p = s; *p; ) {
         if (*p < 0x80) { p++; continue; }
         ascii = 0;
-        len = utf8_decode(p, &cp);
+        len = enc_utf8_decode(p, &cp);
         if (!len) { valid_utf8 = 0; break; }
         int b = cp1252_byte(cp);
         if (b < 0) {
@@ -88,26 +75,35 @@ EncKind enc_write_line(FILE *out, const char *line) {
         p += len;
     }
 
-    if (ascii) { fputs(line, out); return ENC_UNCHANGED; }
+    if (ascii) { sb_puts(out, line); return ENC_UNCHANGED; }
 
     if (!valid_utf8) {                       /* genuine windows-1256 bytes */
         for (p = s; *p; p++)
-            put_utf8(out, *p < 0x80 ? *p : CP1256[*p - 0x80]);
+            sb_put_utf8(out, *p < 0x80 ? *p : CP1256[*p - 0x80]);
         return ENC_CONVERTED;
     }
 
     if (all_1252 && has_arabic) {            /* mojibake: UTF-8 of 1252-decoded 1256 bytes */
         for (p = s; *p; ) {
-            len = utf8_decode(p, &cp);
+            len = enc_utf8_decode(p, &cp);
             int b = cp1252_byte(cp);         /* back to the original byte */
-            put_utf8(out, b < 0x80 ? (unsigned)b : CP1256[b - 0x80]);
+            sb_put_utf8(out, b < 0x80 ? (unsigned)b : CP1256[b - 0x80]);
             p += len;
         }
         return ENC_REPAIRED;
     }
 
-    fputs(line, out);                        /* already proper UTF-8 */
+    sb_puts(out, line);                      /* already proper UTF-8 */
     return ENC_UNCHANGED;
+}
+
+EncKind enc_write_line(FILE *out, const char *line) {
+    StrBuf b;
+    sb_init(&b);
+    EncKind k = enc_convert_line(line, &b);
+    fputs(sb_str(&b), out);
+    sb_free(&b);
+    return k;
 }
 
 void enc_stats_add(EncStats *st, EncKind kind) {
